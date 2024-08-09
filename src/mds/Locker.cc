@@ -72,7 +72,9 @@ public:
 };
 
 Locker::Locker(MDSRank *m, MDCache *c) :
-  need_snapflush_inodes(member_offset(CInode, item_to_flush)), mds(m), mdcache(c) {}
+  revoking_caps(member_offset(Capability, item_revoking_caps)),
+  need_snapflush_inodes(member_offset(CInode, item_to_flush)),
+  mds(m), mdcache(c) {}
 
 
 void Locker::dispatch(const cref_t<Message> &m)
@@ -342,21 +344,23 @@ bool Locker::acquire_locks(const MDRequestRef& mdr,
       }
     } else if (p.is_wrlock()) {
       dout(20) << " must wrlock " << *lock << " " << *object << dendl;
-      client_t _client = p.is_state_pin() ? lock->get_excl_client() : client;
-      if (object->is_auth()) {
-	mustpin.insert(object);
-      } else if (!object->is_auth() &&
-		 !lock->can_wrlock(_client) &&  // we might have to request a scatter
-		 !mdr->is_peer()) {           // if we are peer (remote_wrlock), the leader already authpinned
-	dout(15) << " will also auth_pin " << *object
-		 << " in case we need to request a scatter" << dendl;
-	mustpin.insert(object);
-      }
-      if (need_quiescelock && (lock->get_cap_shift() > 0)) {
-        dout(20) << "need shared quiesce lock for " << p << " on " << SimpleLock::get_lock_type_name(t) << " of " << object << dendl;
-        need_quiescelock = false;
-        CInode *in = static_cast<CInode*>(object);
-        lov.add_wrlock(&in->quiescelock, i + 1);
+      if (!lock->is_locallock()) {
+        client_t _client = p.is_state_pin() ? lock->get_excl_client() : client;
+        if (object->is_auth()) {
+	  mustpin.insert(object);
+        } else if (!object->is_auth() &&
+		   !lock->can_wrlock(_client) &&  // we might have to request a scatter
+		   !mdr->is_peer()) {           // if we are peer (remote_wrlock), the leader already authpinned
+	  dout(15) << " will also auth_pin " << *object
+		   << " in case we need to request a scatter" << dendl;
+	  mustpin.insert(object);
+        }
+        if (need_quiescelock && (lock->get_cap_shift() > 0)) {
+          dout(20) << "need shared quiesce lock for " << p << " on " << SimpleLock::get_lock_type_name(t) << " of " << object << dendl;
+          need_quiescelock = false;
+          CInode *in = static_cast<CInode*>(object);
+          lov.add_wrlock(&in->quiescelock, i + 1);
+        }
       }
     } else if (p.is_remote_wrlock()) {
       dout(20) << " must remote_wrlock on mds." << p.wrlock_target << " "
@@ -370,6 +374,7 @@ bool Locker::acquire_locks(const MDRequestRef& mdr,
       }
     } else if (p.is_rdlock()) {
       dout(20) << " must rdlock " << *lock << " " << *object << dendl;
+      ceph_assert(!lock->is_locallock());
       if (object->is_auth()) {
 	mustpin.insert(object);
       } else if (!object->is_auth() &&
@@ -2629,9 +2634,11 @@ int Locker::issue_caps(CInode *in, Capability *only_cap)
 
       int op = (before & ~after) ? CEPH_CAP_OP_REVOKE : CEPH_CAP_OP_GRANT;
       if (op == CEPH_CAP_OP_REVOKE) {
-        if (mds->logger) mds->logger->inc(l_mdss_ceph_cap_op_revoke);
+	if (mds->logger) mds->logger->inc(l_mdss_ceph_cap_op_revoke);
 	revoking_caps.push_back(&cap->item_revoking_caps);
-	revoking_caps_by_client[cap->get_client()].push_back(&cap->item_client_revoking_caps);
+	auto em = revoking_caps_by_client.emplace(cap->get_client(),
+						  member_offset(Capability, item_client_revoking_caps));
+	em.first->second.push_back(&cap->item_client_revoking_caps);
 	cap->set_last_revoke_stamp(ceph_clock_now());
 	cap->reset_num_revoke_warnings();
       } else {
@@ -2670,7 +2677,7 @@ void Locker::issue_truncate(CInode *in)
                                        cap->get_mseq(),
                                        mds->get_osd_epoch_barrier());
     in->encode_cap_message(m, cap);			     
-    mds->send_message_client_counted(m, p.first);
+    mds->send_message_client_counted(m, cap->get_session());
   }
 
   // should we increase max_size?
@@ -3160,7 +3167,7 @@ void Locker::share_inode_max_size(CInode *in, Capability *only_cap)
                                          cap->get_mseq(),
                                          mds->get_osd_epoch_barrier());
       in->encode_cap_message(m, cap);
-      mds->send_message_client_counted(m, client);
+      mds->send_message_client_counted(m, cap->get_session());
     }
     if (only_cap)
       break;
@@ -4311,42 +4318,33 @@ void Locker::remove_client_cap(CInode *in, Capability *cap, bool kill)
   try_eval(in, CEPH_CAP_LOCKS);
 }
 
-
-/**
- * Return true if any currently revoking caps exceed the
- * session_timeout threshold.
- */
-bool Locker::any_late_revoking_caps(xlist<Capability*> const &revoking,
-                                    double timeout) const
+std::set<client_t> Locker::get_late_revoking_clients(double timeout)
 {
-    xlist<Capability*>::const_iterator p = revoking.begin();
-    if (p.end()) {
+  auto any_late_revoking = [timeout](elist<Capability*> &revoking) {
+    auto p = revoking.begin();
+    if (p.end())
       // No revoking caps at the moment
       return false;
-    } else {
-      utime_t now = ceph_clock_now();
-      utime_t age = now - (*p)->get_last_revoke_stamp();
-      if (age <= timeout) {
-          return false;
-      } else {
-          return true;
-      }
-    }
-}
 
-std::set<client_t> Locker::get_late_revoking_clients(double timeout) const
-{
+    utime_t now = ceph_clock_now();
+    return now - (*p)->get_last_revoke_stamp() > timeout;
+  };
+
   std::set<client_t> result;
-
-  if (any_late_revoking_caps(revoking_caps, timeout)) {
-    // Slow path: execute in O(N_clients)
-    for (auto &p : revoking_caps_by_client) {
-      if (any_late_revoking_caps(p.second, timeout)) {
-        result.insert(p.first);
-      }
-    }
-  } else {
+  if (!any_late_revoking(revoking_caps)) {
     // Fast path: no misbehaving clients, execute in O(1)
+  } else {
+    // Slow path: execute in O(N_clients)
+    for (auto it = revoking_caps_by_client.begin();
+	 it != revoking_caps_by_client.end(); ) {
+      if (it->second.empty()) {
+	revoking_caps_by_client.erase(it++);
+	continue;
+      }
+      if (any_late_revoking(it->second))
+	result.insert(it->first);
+      ++it;
+    }
   }
   return result;
 }
@@ -4378,11 +4376,10 @@ void Locker::caps_tick()
     }
   }
 
-  dout(20) << __func__ << " " << revoking_caps.size() << " revoking caps" << dendl;
 
   now = ceph_clock_now();
   int n = 0;
-  for (xlist<Capability*>::iterator p = revoking_caps.begin(); !p.end(); ++p) {
+  for (auto p = revoking_caps.begin(); !p.end(); ++p) {
     Capability *cap = *p;
 
     utime_t age = now - cap->get_last_revoke_stamp();
@@ -4508,7 +4505,7 @@ void Locker::issue_client_lease(CDentry *dn, CInode *in, const MDRequestRef& mdr
         ceph_assert(!in);
     }
     // issue a dentry lease
-    ClientLease *l = dn->add_client_lease(client, session);
+    ClientLease *l = dn->add_client_lease(session);
     session->touch_lease(l);
     
     int pool = 1;   // fixme.. do something smart!
@@ -4537,11 +4534,8 @@ void Locker::issue_client_lease(CDentry *dn, CInode *in, const MDRequestRef& mdr
 void Locker::revoke_client_leases(SimpleLock *lock)
 {
   CDentry *dn = static_cast<CDentry*>(lock->get_parent());
-  for (map<client_t, ClientLease*>::iterator p = dn->client_lease_map.begin();
-       p != dn->client_lease_map.end();
-       ++p) {
-    ClientLease *l = p->second;
-
+  for (ClientLease& l : dn->client_leases) {
+    
     ceph_assert(lock->get_type() == CEPH_LOCK_DN);
 
     CDentry *dn = static_cast<CDentry*>(lock->get_parent());
@@ -4549,8 +4543,8 @@ void Locker::revoke_client_leases(SimpleLock *lock)
 
     // i should also revoke the dir ICONTENT lease, if they have it!
     CInode *diri = dn->get_dir()->get_inode();
-    auto lease = make_message<MClientLease>(CEPH_MDS_LEASE_REVOKE, l->seq, mask, diri->ino(), diri->first, CEPH_NOSNAP, dn->get_name());
-    mds->send_message_client_counted(lease, l->client);
+    auto lease = make_message<MClientLease>(CEPH_MDS_LEASE_REVOKE, l.seq, mask, diri->ino(), diri->first, CEPH_NOSNAP, dn->get_name());
+    mds->send_message_client_counted(lease, l.session);
   }
 }
 

@@ -602,9 +602,6 @@ private:
   void _flush_bdev();  // this is safe to call without a lock
   void _flush_bdev(std::array<bool, MAX_BDEV>& dirty_bdevs);  // this is safe to call without a lock
 
-  int _preallocate(FileRef f, uint64_t off, uint64_t len);
-  int _truncate(FileWriter *h, uint64_t off);
-
   int64_t _read(
     FileReader *h,   ///< [in] read from here
     uint64_t offset, ///< [in] offset
@@ -743,6 +740,7 @@ public:
 		       bluefs_shared_alloc_context_t* _shared_alloc = nullptr);
   bool bdev_support_label(unsigned id);
   uint64_t get_block_device_size(unsigned bdev) const;
+  BlockDevice* get_block_device(unsigned bdev) const;
 
   // handler for discard event
   void handle_discard(unsigned dev, interval_set<uint64_t>& to_release);

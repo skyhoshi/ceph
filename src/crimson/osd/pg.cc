@@ -513,6 +513,35 @@ Context *PG::on_clean()
   return nullptr;
 }
 
+seastar::future<> PG::clear_temp_objects()
+{
+  logger().info("{} {}", __func__, pgid);
+  ghobject_t _next;
+  ceph::os::Transaction t;
+  auto max_size = local_conf()->osd_target_transaction_size;
+  while(true) {
+    auto [objs, next] = co_await shard_services.get_store().list_objects(
+      coll_ref, _next, ghobject_t::get_max(), max_size);
+    if (objs.empty()) {
+      if (!t.empty()) {
+        co_await shard_services.get_store().do_transaction(
+          coll_ref, std::move(t));
+      }
+      break;
+    }
+    for (auto &obj : objs) {
+      if (obj.hobj.is_temp()) {
+        t.remove(coll_ref->get_cid(), obj);
+      }
+    }
+    _next = next;
+    if (t.get_num_ops() >= max_size) {
+      co_await shard_services.get_store().do_transaction(
+        coll_ref, t.claim_and_reset());
+    }
+  }
+}
+
 PG::interruptible_future<seastar::stop_iteration> PG::trim_snap(
   snapid_t to_trim,
   bool needs_pause)
@@ -1696,6 +1725,28 @@ bool PG::is_degraded_or_backfilling_object(const hobject_t& soid) const {
     }
   }
   return false;
+}
+
+bool PG::should_send_op(
+  pg_shard_t peer,
+  const hobject_t &hoid) const
+{
+  if (peer == get_primary())
+    return true;
+  bool should_send =
+    (hoid.pool != (int64_t)get_info().pgid.pool() ||
+    (has_backfill_state() && hoid <= get_last_backfill_started()) ||
+    hoid <= peering_state.get_peer_info(peer).last_backfill);
+  if (!should_send) {
+    ceph_assert(is_backfill_target(peer));
+    logger().debug("{} issue_repop shipping empty opt to osd."
+                   "{}, object {} beyond std::max(last_backfill_started, "
+                   "peer_info[peer].last_backfill {})",
+                   peer, hoid, peering_state.get_peer_info(peer).last_backfill);
+  }
+  return should_send;
+  // TODO: should consider async recovery cases in the future which are not supported
+  //       by crimson yet
 }
 
 PG::interruptible_future<std::optional<PG::complete_op_t>>

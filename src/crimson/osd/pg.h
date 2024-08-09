@@ -521,6 +521,7 @@ public:
   bool get_need_up_thru() const {
     return peering_state.get_need_up_thru();
   }
+  bool should_send_op(pg_shard_t peer, const hobject_t &hoid) const;
   epoch_t get_same_interval_since() const {
     return get_info().history.same_interval_since;
   }
@@ -603,6 +604,7 @@ public:
     ObjectContextRef obc,
     const std::error_code e,
     ceph_tid_t rep_tid);
+  seastar::future<> clear_temp_objects();
 
 private:
 
@@ -739,6 +741,15 @@ public:
   }
   PeeringState& get_peering_state() final {
     return peering_state;
+  }
+  bool has_backfill_state() const {
+    return (bool)(recovery_handler->backfill_state);
+  }
+  const BackfillState& get_backfill_state() const {
+    return *recovery_handler->backfill_state;
+  }
+  hobject_t get_last_backfill_started() const {
+    return get_backfill_state().get_last_backfill_started();
   }
   bool has_reset_since(epoch_t epoch) const final {
     return peering_state.pg_has_reset_since(epoch);

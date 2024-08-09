@@ -3172,7 +3172,7 @@ def command_shell(ctx):
             daemon_type = ctx.name
             daemon_id = None
     else:
-        daemon_type = 'osd'  # get the most mounts
+        daemon_type = 'shell'  # get limited set of mounts
         daemon_id = None
 
     if ctx.fsid and daemon_type in ceph_daemons():
@@ -3310,7 +3310,7 @@ def command_ceph_volume(ctx):
         lock.acquire()
 
     (uid, gid) = (0, 0)  # ceph-volume runs as root
-    mounts = get_container_mounts_for_type(ctx, ctx.fsid, 'osd')
+    mounts = get_container_mounts_for_type(ctx, ctx.fsid, 'ceph-volume')
 
     tmp_config = None
     tmp_keyring = None
@@ -3545,6 +3545,8 @@ def list_daemons(
                                 version = CephIscsi.get_version(ctx, container_id)
                             if daemon_type == CephNvmeof.daemon_type:
                                 version = CephNvmeof.get_version(ctx, container_id)
+                            if daemon_type == SMB.daemon_type:
+                                version = SMB.get_version(ctx, container_id)
                             elif not version:
                                 if daemon_type in ceph_daemons():
                                     out, err, code = call(ctx,

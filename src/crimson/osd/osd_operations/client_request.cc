@@ -23,10 +23,18 @@ namespace crimson::osd {
 void ClientRequest::Orderer::requeue(Ref<PG> pg)
 {
   LOG_PREFIX(ClientRequest::Orderer::requeue);
-  for (auto &req: list) {
-    DEBUGDPP("requeueing {}", *pg, req);
-    req.reset_instance_handle();
-    std::ignore = req.with_pg_process(pg);
+  std::list<ClientRequest*> to_requeue;
+  for (auto &req : list) {
+    to_requeue.emplace_back(&req);
+  }
+  // Client requests might be destroyed in the following
+  // iteration leading to short lived dangling pointers
+  // to those requests, but this doesn't hurt as we won't
+  // dereference those dangling pointers.
+  for (auto req: to_requeue) {
+    DEBUGDPP("requeueing {}", *pg, *req);
+    req->reset_instance_handle();
+    std::ignore = req->with_pg_process(pg);
   }
 }
 
@@ -286,6 +294,7 @@ ClientRequest::recover_missing_snaps(
   ObjectContextRef head,
   std::set<snapid_t> &snaps)
 {
+  LOG_PREFIX(ClientRequest::process_op);
   co_await ihref.enter_stage<interruptor>(
     client_pp(*pg).recover_missing_snaps, *this);
   for (auto &snap : snaps) {
@@ -299,7 +308,12 @@ ClientRequest::recover_missing_snaps(
      * we skip the oid as there is no corresponding clone to recover.
      * See https://tracker.ceph.com/issues/63821 */
     if (oid) {
-      co_await do_recover_missing(pg, *oid, m->get_reqid());
+      auto unfound = co_await do_recover_missing(pg, *oid, m->get_reqid());
+      if (unfound) {
+        DEBUGDPP("{} unfound, hang it for now", *pg, m->get_hobj().get_head());
+        co_await interruptor::make_interruptible(
+          pg->get_recovery_backend()->add_unfound(m->get_hobj().get_head()));
+      }
     }
   }
 }
@@ -317,7 +331,14 @@ ClientRequest::process_op(
       "Skipping recover_missings on non primary pg for soid {}",
       *pg, m->get_hobj());
   } else {
-    co_await do_recover_missing(pg, m->get_hobj().get_head(), m->get_reqid());
+    auto unfound = co_await do_recover_missing(
+      pg, m->get_hobj().get_head(), m->get_reqid());
+    if (unfound) {
+      DEBUGDPP("{} unfound, hang it for now", *pg, m->get_hobj().get_head());
+      co_await interruptor::make_interruptible(
+        pg->get_recovery_backend()->add_unfound(m->get_hobj().get_head()));
+    }
+
     std::set<snapid_t> snaps = snaps_need_to_recover();
     if (!snaps.empty()) {
       // call with_obc() in order, but wait concurrently for loading.
